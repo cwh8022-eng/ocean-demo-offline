@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>海洋廢棄物辨識 Demo（完全離線版）</title>
+  <!-- 使用本地檔案，請先將 tf.min.js 與 tm-image.min.js 放入 ./vendor/ -->
+  <script src="./vendor/tf.min.js"></script>
+  <script src="./vendor/teachablemachine-image.min.js"></script>
+  <style>
+    body{font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; margin:0; background:#f7f7fb; color:#1f2937;}
+    .wrap{max-width:980px; margin:24px auto; padding:0 16px;}
+    h1{font-size:24px; margin:0 0 8px 0;}
+    .card{background:#fff; border-radius:16px; box-shadow:0 4px 16px rgba(0,0,0,.06); padding:16px;}
+    .grid{display:grid; grid-template-columns:1fr; gap:16px;}
+    @media(min-width:900px){ .grid{ grid-template-columns: 1fr 1fr; } }
+    .row{display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px;}
+    .btn{padding:10px 12px; border:none; border-radius:12px; cursor:pointer; font-weight:600;}
+    .btn.primary{background:#2563eb; color:#fff;}
+    .btn.green{background:#059669; color:#fff;}
+    .btn.gray{background:#e5e7eb; color:#111827;}
+    .muted{color:#6b7280; font-size:12px;}
+    .barbg{width:100%; height:10px; background:#e5e7eb; border-radius:999px; overflow:hidden;}
+    .bar{height:10px; background:#10b981; width:0%;}
+    .top{display:flex; justify-content:space-between; font-size:14px; margin-bottom:6px;}
+    .aspect{position:relative; width:100%; padding-top:56.25%; background:#f1f5f9; border:2px dashed #cbd5e1; border-radius:12px; display:flex; align-items:center; justify-content:center; color:#64748b;}
+    .aspect > div{position:absolute; inset:0; display:flex; align-items:center; justify-content:center; flex-direction:column;}
+    #webcamContainer canvas{max-width:100%; border-radius:12px;}
+    img.preview{max-height:320px; border-radius:12px;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>海洋廢棄物辨識 Demo（完全離線）</h1>
+    <p class="muted">請確認 <code>./vendor/</code> 內已放入 <code>tf.min.js</code> 與 <code>teachablemachine-image.min.js</code>，以及 <code>./model/</code> 內有 <code>model.json</code>、<code>metadata.json</code>、<code>weights.bin</code>。</p>
+
+    <div class="row">
+      <div class="card">
+        <strong>步驟 1｜載入模型</strong>
+        <div style="margin-top:8px">
+          <label class="muted">模型資料夾位置（預設 ./model/）</label>
+          <input id="modelPath" value="./model/" style="width:100%; padding:8px; border:1px solid #d1d5db; border-radius:10px">
+          <button id="btnLoad" class="btn primary" style="width:100%; margin-top:8px">載入模型</button>
+          <div id="modelStatus" class="muted" style="margin-top:8px">尚未載入模型</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <strong>步驟 2｜即時辨識（攝影機）</strong>
+        <div style="display:flex; gap:10px; margin-top:8px">
+          <button id="btnStartCam" class="btn green" style="flex:1">啟動攝影機</button>
+          <button id="btnStopCam" class="btn gray" style="flex:1">關閉攝影機</button>
+        </div>
+        <div class="muted" style="margin-top:6px">提示：攝影機需在 <b>localhost</b> 或 <b>HTTPS</b> 環境。</div>
+      </div>
+
+      <div class="card">
+        <strong>步驟 2（替代）｜上傳圖片辨識</strong>
+        <input id="fileInput" type="file" accept="image/*" style="width:100%; margin-top:8px">
+        <div class="muted" style="margin-top:6px">支援拖放：將圖片拖曳到下方灰框區域。</div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:16px">
+      <div class="card">
+        <strong>影像來源</strong>
+        <div id="dropZone" class="aspect" style="margin-top:8px">
+          <div>
+            <div id="webcamContainer"></div>
+            <img id="preview" class="preview" style="display:none" alt="預覽圖">
+            <div id="hint" class="muted" style="margin-top:8px">啟動攝影機或上傳圖片</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <strong>辨識結果</strong>
+        <div class="top" style="margin-top:8px">
+          <div>Top-1 類別：<span id="top1" style="font-weight:700; color:#047857">—</span></div>
+          <div>FPS：<span id="fps">—</span></div>
+        </div>
+        <div id="labels" style="display:flex; flex-direction:column; gap:10px"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  let model, webcam, maxPredictions = 0, labelContainer;
+  let running = false; let lastTime = performance.now(); let frames = 0;
+  const $ = (id) => document.getElementById(id);
+
+  function setStatus(msg, ok=false){
+    const el = $("modelStatus");
+    el.textContent = msg;
+    el.style.color = ok ? "#047857" : "#b91c1c";
+  }
+
+  async function loadModel(){
+    try{
+      const base = $("modelPath").value.trim().replace(/\\+/g,"/");
+      const modelURL = base.replace(/\/$/, "/") + "model.json";
+      const metadataURL = base.replace(/\/$/, "/") + "metadata.json";
+      model = await tmImage.load(modelURL, metadataURL);
+      maxPredictions = model.getTotalClasses();
+      buildLabelList();
+      setStatus("模型載入完成 ✅", true);
+    }catch(err){
+      console.error(err);
+      setStatus("模型載入失敗：請確認路徑與檔案。", false);
+    }
+  }
+
+  function buildLabelList(){
+    labelContainer = $("labels");
+    labelContainer.innerHTML = "";
+    const labels = model.getClassLabels ? model.getClassLabels() : [];
+    for(let i=0;i<maxPredictions;i++){
+      const name = labels[i]?.className || labels[i] || `Class ${i+1}`;
+      const row = document.createElement("div");
+      row.innerHTML = `
+        <div class="top">
+          <span style="font-weight:600">${name}</span>
+          <span id="pval-${i}">0.00</span>
+        </div>
+        <div class="barbg"><div id="bar-${i}" class="bar"></div></div>`;
+      labelContainer.appendChild(row);
+    }
+  }
+
+  async function startWebcam(){
+    if(!model){ setStatus("請先載入模型", false); return; }
+    try{
+      const flip = true;
+      webcam = new tmImage.Webcam(320, 240, flip);
+      await webcam.setup();
+      await webcam.play();
+      running = true;
+      $("webcamContainer").innerHTML = "";
+      $("webcamContainer").appendChild(webcam.canvas);
+      $("preview").style.display = "none";
+      $("hint").textContent = "攝影機已啟動";
+      window.requestAnimationFrame(loop);
+    }catch(err){
+      console.error(err);
+      $("hint").textContent = "無法啟動攝影機，請確認權限或環境。您也可以改用上傳圖片辨識。";
+    }
+  }
+
+  async function stopWebcam(){
+    running = false;
+    if(webcam){
+      webcam.stop();
+      $("webcamContainer").innerHTML = "";
+      $("hint").textContent = "攝影機已關閉";
+    }
+  }
+
+  async function loop(){
+    if(!running) return;
+    webcam.update();
+    await predict(webcam.canvas);
+    frames++;
+    const now = performance.now();
+    if(now - lastTime >= 1000){ $("fps").textContent = frames.toString(); frames = 0; lastTime = now; }
+    window.requestAnimationFrame(loop);
+  }
+
+  async function predict(source){
+    const preds = await model.predict(source);
+    const sorted = [...preds].sort((a,b)=> b.probability - a.probability);
+    const t1 = sorted[0];
+    $("top1").textContent = `${t1.className} (${t1.probability.toFixed(2)})`;
+    for(let i=0;i<preds.length;i++){
+      const p = preds[i].probability;
+      const w = Math.round(p*100);
+      const bar = $("bar-"+i);
+      const val = $("pval-"+i);
+      if(bar) bar.style.width = w+"%";
+      if(val) val.textContent = p.toFixed(2);
+    }
+  }
+
+  function handleFile(file){
+    if(!model){ setStatus("請先載入模型", false); return; }
+    const img = $("preview");
+    img.onload = async ()=>{
+      img.style.display = "block";
+      $("hint").textContent = "圖片已載入，開始辨識";
+      await predict(img);
+    };
+    img.src = URL.createObjectURL(file);
+  }
+
+  const dropZone = document.getElementById("dropZone");
+  dropZone.addEventListener("dragover", e=>{ e.preventDefault(); dropZone.style.borderColor = "#10b981"; });
+  dropZone.addEventListener("dragleave", e=>{ dropZone.style.borderColor = "#cbd5e1"; });
+  dropZone.addEventListener("drop", e=>{
+    e.preventDefault(); dropZone.style.borderColor = "#cbd5e1";
+    const file = e.dataTransfer.files?.[0];
+    if(file) handleFile(file);
+  });
+
+  document.getElementById("btnLoad").addEventListener("click", loadModel);
+  document.getElementById("btnStartCam").addEventListener("click", startWebcam);
+  document.getElementById("btnStopCam").addEventListener("click", stopWebcam);
+  document.getElementById("fileInput").addEventListener("change", e=>{
+    const file = e.target.files?.[0];
+    if(file) handleFile(file);
+  });
+</script>
+</body>
+</html>
